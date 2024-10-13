@@ -6,10 +6,12 @@ import requests
 import asyncio
 import os
 import datetime
+import logging
+import json
 
 # MQTT Broker and topics
 BROKER = "35.240.151.148"
-TOPICS = ["/1234/Camera001/attrs", "/1234/Camera002/attrs"]
+TOPICS = ["/1234/Camera001/attrs", "/1234/Camera002/attrs" , "/1234/Robot001/log" , "/1234/Robot001/attrs"] #/1234/Robot001/attrs
 TELEGRAM_BOT_TOKEN = "7775950726:AAGNbYtQ92sjyPRiYK78c7uo1B0_RityZEc"
 
 # Track last alert times to enforce the 7-second rule
@@ -21,6 +23,12 @@ user_data = {}
 # Global variable to store names for sending:
 global_last_names = []
 global_imagepath = None  # Store the image path globally
+
+shirt_color = "Unknown"
+robot_imagepath = None
+robot_observedat = None
+robot_faces = []
+
 
 # Telegram bot handlers
 async def start(update: Update, context):
@@ -68,24 +76,101 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
-    global global_last_names, global_imagepath  # Declare as global
-    message = eval(msg.payload.decode())
-    names = message.get("names", "")
-    global_imagepath = message.get("imagepath")  # Store the imagepath globally
+    global global_last_names, global_imagepath, shirt_color  # Declare as global
+    global robot_imagepath, robot_faces, robot_observedat
 
-    current_time = time.time()
+    try:
+        # Use json instead of eval for safe JSON parsing
+        message = json.loads(msg.payload.decode())
+    except json.JSONDecodeError as e:
+        print(f"Failed to decode message: {e}")
+        return  # Exit if the message is not valid JSON
 
-    # If names is a string, convert to list
-    if isinstance(names, str):
-        names = [names]
+    if msg.topic == TOPICS[0] or msg.topic == TOPICS[1]:
+        names = message.get("names", "")
+        global_imagepath = message.get("imagepath")  # Store the imagepath globally
+        shirt_color = message.get("color")
+        current_time = time.time()
 
-    # Set global variable to trigger send_detection_alert from main fn
-    global_last_names = names
-    print("Message received: ", message)  # Moved this line down after processing the message
+        # If names is a string, convert to list
+        if isinstance(names, str):
+            names = [names]
+        # Set global variable to trigger send_detection_alert from main function
+        global_last_names = names
+        
+    elif msg.topic == TOPICS[2]:
+        print("Logs topic")
+        
+    elif msg.topic == TOPICS[3]:
+        if robot_imagepath is None:
+            robot_imagepath = message.get("imagepath") 
+            robot_observedat = message.get("timestamp")
+            print("Robot image path received")
+        else:
+            print("Wait for next detection to update")
+    else:
+        print("Unregistered topic received")
+
+
+
+async def trigger_send_robot_image():
+    global robot_observedat, robot_imagepath, robot_faces
+    
+    for user_id in user_data.keys():  # Loop through user data
+        detected_name = user_data[user_id].get('detected_name')
+        await send_robot_image(user_data[user_id], robot_faces , robot_imagepath)  # Pass user context
+        
+    await asyncio.sleep(0.1)  # Sleep to avoid blocking the loop
+
+
+async def send_robot_image(user_context,   name , imagepath):
+    global robot_observedat
+    # Download the image
+    image_url = imagepath
+    image_response = requests.get(image_url)
+
+    # Generate a unique filename using the current timestamp
+    current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_filename = f"./snapshots/robot_{current_timestamp}.jpg"  # Using the robot and timestamp
+    name = "Unknown" #Reset name
+    
+    if len(name)<2:
+        name = "Unknown"
+    
+    # Save image locally
+    if image_response.status_code == 200:
+        with open(image_filename, "wb") as f:
+            f.write(image_response.content)
+
+        print(f"Image from Robot with {name} ! Image downloaded and saved as {image_filename}.")
+
+        # Prepare the message to send
+        detection_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get current time
+        #caption = f"Image from robot {name} detected at {robot_observedat}"
+        caption = f"Image from robot detected at {robot_observedat}"
+
+        # Send the image to the user
+        chat_id = user_context['chat_id']  # Get the chat ID from user data
+        bot = user_context['bot']  # Retrieve the bot instance from user data
+        with open(image_filename, "rb") as photo:
+            print("Opened image file for sending")
+            try:
+                await bot.send_photo(chat_id, photo, caption=caption)
+            except Exception as e:
+                # Log the error and continue
+                logging.error(f"Failed to send alert to {chat_id}: {e}")
+            await asyncio.sleep(0.1)
+            #send_message_to_user(chat_id, f"Image from robot with: {name} ")
+            send_message_to_user(chat_id, f"Image from robot triggered ")
+
+    else:
+        print(f"Failed to download image from {image_url}. Status code: {image_response.status_code}")
+
+
 
 
 async def trigger_send_detection_alert_function(imagepath):
-    global global_last_names  # Declare as global
+    global global_last_names , shirt_color  # Declare as global
     current_time = time.time()  # Move this inside the function
     for user_id in user_data.keys():  # Loop through user data
         detected_name = user_data[user_id].get('detected_name')
@@ -99,11 +184,11 @@ async def trigger_send_detection_alert_function(imagepath):
                 if name in last_alert_times and current_time - last_alert_times[name] < 7:
                     continue
                 last_alert_times[name] = current_time
-                await send_detection_alert(user_data[user_id], name, imagepath)  # Pass user context
+                await send_detection_alert(user_data[user_id], name, shirt_color, imagepath)  # Pass user context
         await asyncio.sleep(0.1)  # Sleep to avoid blocking the loop
 
 
-async def send_detection_alert(user_context, name, imagepath):
+async def send_detection_alert(user_context, name, shirt_color, imagepath):
     # Download the image
     image_url = imagepath
     image_response = requests.get(image_url)
@@ -128,8 +213,12 @@ async def send_detection_alert(user_context, name, imagepath):
         bot = user_context['bot']  # Retrieve the bot instance from user data
         with open(image_filename, "rb") as photo:
             print("Opened image file for sending")
-            await bot.send_photo(chat_id, photo, caption=caption)
-            send_message_to_user(chat_id, f"{name} was detected")
+            try:
+                await bot.send_photo(chat_id, photo, caption=caption)
+            except Exception as e:
+                # Log the error and continue
+                logging.error(f"Failed to send alert to {chat_id}: {e}")
+            send_message_to_user(chat_id, f"{name} was detected with shirt color {shirt_color}")
     else:
         print(f"Failed to download image from {image_url}. Status code: {image_response.status_code}")
 
@@ -143,8 +232,10 @@ def send_message_to_user(chat_id, message):
     requests.post(url, json=payload)
 
 
+
+
 async def run_bot():
-    global global_last_names
+    global global_last_names, robot_observedat, robot_imagepath #robot_faces
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Add handlers
@@ -166,6 +257,7 @@ async def run_bot():
     # Start polling for updates
     await application.updater.start_polling()
 
+    robot_image_counter = 0
     # Keep the bot running
     try:
         while True:
@@ -175,6 +267,15 @@ async def run_bot():
                 print("Names received: ", global_last_names)
                 await trigger_send_detection_alert_function(global_imagepath)  # Pass the imagepath
                 global_last_names = []
+                robot_image_counter = 2
+                robot_imagepath = None
+                
+            if robot_imagepath is not None:
+                if robot_image_counter > 0:
+                    await trigger_send_robot_image() 
+                    robot_image_counter = robot_image_counter - 1
+                    robot_imagepath = None
+                
  
     except KeyboardInterrupt:
         print("Stopping the bot...")
