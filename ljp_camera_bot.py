@@ -9,7 +9,7 @@ import datetime
 import logging
 import json
 
-# MQTT Broker and topics
+#  Broker and topics
 BROKER = "35.240.151.148"
 TOPICS = ["/1234/Camera001/attrs", "/1234/Camera002/attrs" , "/1234/Robot001/log" , "/1234/Robot001/attrs"] #/1234/Robot001/attrs
 TELEGRAM_BOT_TOKEN = "7775950726:AAGNbYtQ92sjyPRiYK78c7uo1B0_RityZEc"
@@ -23,6 +23,7 @@ user_data = {}
 # Global variable to store names for sending:
 global_last_names = []
 global_imagepath = None  # Store the image path globally
+global_last_topic = ""
 
 shirt_color = "Unknown"
 robot_imagepath = None
@@ -70,14 +71,14 @@ async def receive_name(update: Update, context):
 
 
 def on_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT broker with result code {rc}")
+    print(f"Connected to broker with result code {rc}")
     for topic in TOPICS:
         client.subscribe(topic)
 
 
 def on_message(client, userdata, msg):
     global global_last_names, global_imagepath, shirt_color  # Declare as global
-    global robot_imagepath, robot_faces, robot_observedat
+    global robot_imagepath, robot_faces, robot_observedat, global_last_topic
 
     try:
         # Use json instead of eval for safe JSON parsing
@@ -89,14 +90,23 @@ def on_message(client, userdata, msg):
     if msg.topic == TOPICS[0] or msg.topic == TOPICS[1]:
         names = message.get("names", "")
         global_imagepath = message.get("imagepath")  # Store the imagepath globally
-        shirt_color = message.get("color")
-        current_time = time.time()
+        
+        if "alerts" in global_imagepath:
+            shirt_color = message.get("color")
+            current_time = time.time()
 
-        # If names is a string, convert to list
-        if isinstance(names, str):
-            names = [names]
-        # Set global variable to trigger send_detection_alert from main function
-        global_last_names = names
+            # If names is a string, convert to list
+            if isinstance(names, str):
+                names = [names]
+            # Set global variable to trigger send_detection_alert from main function
+            global_last_names = names
+            print("Alert footage ")
+            global_last_topic =  msg.topic # Store topic to ret camera name
+            
+            print("Imagepath: ", global_imagepath)
+        else:
+            print("Survelliance footage ")
+            print("Imagepath: ", global_imagepath)
         
     elif msg.topic == TOPICS[2]:
         print("Logs topic")
@@ -173,13 +183,14 @@ async def trigger_send_detection_alert_function(imagepath):
     global global_last_names , shirt_color  # Declare as global
     current_time = time.time()  # Move this inside the function
     for user_id in user_data.keys():  # Loop through user data
-        detected_name = user_data[user_id].get('detected_name')
-        if detected_name and any(detected_name.lower() == name.lower() for name in global_last_names):
+        detected_name = user_data[user_id].get('detected_name') 
+        if detected_name and any(detected_name.lower() == name.lower() for name in global_last_names): #Looking for specific person
             if detected_name in last_alert_times and current_time - last_alert_times[detected_name] < 7:
                 continue
             last_alert_times[detected_name] = current_time
-            await send_detection_alert(user_data[user_id], detected_name, imagepath)  # Pass user context
-        elif not detected_name:
+            print("Await: ", imagepath)
+            await send_detection_alert(user_data[user_id], detected_name, shirt_color, imagepath)  # Pass user context
+        elif not detected_name: #Not looking for anyone in particular
             for name in global_last_names:
                 if name in last_alert_times and current_time - last_alert_times[name] < 7:
                     continue
@@ -218,7 +229,12 @@ async def send_detection_alert(user_context, name, shirt_color, imagepath):
             except Exception as e:
                 # Log the error and continue
                 logging.error(f"Failed to send alert to {chat_id}: {e}")
-            send_message_to_user(chat_id, f"{name} was detected with shirt color {shirt_color}")
+
+            camera_name = "Camera001"
+            if "002" in global_last_topic:
+                camera_name= "Camera002"
+                
+            send_message_to_user(chat_id, f"{name} was detected with shirt color {shirt_color} by {camera_name} located in Room001")
     else:
         print(f"Failed to download image from {image_url}. Status code: {image_response.status_code}")
 
@@ -247,7 +263,7 @@ async def run_bot():
     await application.initialize()  # Ensure the application is initialized
     await application.start()
 
-    # Start the MQTT client
+    # Start the client
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
@@ -265,16 +281,20 @@ async def run_bot():
             
             if len(global_last_names) > 0 and global_imagepath:  # Check if both names and imagepath are available
                 print("Names received: ", global_last_names)
+                print("Imagepath: ", global_imagepath)
                 await trigger_send_detection_alert_function(global_imagepath)  # Pass the imagepath
                 global_last_names = []
                 robot_image_counter = 2
                 robot_imagepath = None
-                
+            
+            #Comment out robot image block
+            '''
             if robot_imagepath is not None:
                 if robot_image_counter > 0:
                     await trigger_send_robot_image() 
                     robot_image_counter = robot_image_counter - 1
                     robot_imagepath = None
+            '''
                 
  
     except KeyboardInterrupt:
